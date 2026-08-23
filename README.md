@@ -1,12 +1,11 @@
 <div align="center">
 
-> **📌 This is a maintained fork.** The original project lived at
-> [gitea.com/DuarteSantos/openGym](https://gitea.com/DuarteSantos/openGym) (mirrored at
-> `github.com/DuarteSantos8/openGym`); as of August 2026 that repository is suspended/unavailable
-> and the original author is unreachable. This fork — **[asachs01/opengym](https://github.com/asachs01/opengym)**
-> — continues development under the same AGPL-3.0 license. All credit for the original design,
-> feature set, and exercise-tracking logic belongs to the upstream author. See
-> [ATTRIBUTION.md](ATTRIBUTION.md) for details.
+> **📌 This is a fork.** The upstream project — **openGym**, created by Duarte Santos — is
+> actively maintained at [gitlab.com/DuarteSantos8/opengym](https://gitlab.com/DuarteSantos8/opengym)
+> with official Docker images, CI/CD, and an Android APK. If you're new to openGym, **use the
+> upstream repo**; it has more features, more languages, and a real community around it. This
+> fork exists to run our own instance and adds OAuth2 API auth + persisted equipment profiles
+> that aren't upstream yet — see [ATTRIBUTION.md](ATTRIBUTION.md) for what's different and why.
 
 </div>
 
