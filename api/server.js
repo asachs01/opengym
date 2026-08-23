@@ -36,10 +36,13 @@ if (!fs.existsSync(secretFile)) fs.writeFileSync(secretFile, crypto.randomBytes(
 const SECRET = fs.readFileSync(secretFile, 'utf8').trim();
 
 const dbFile = path.join(DATA, 'db.json');
-let db = { users: [], creds: [], subs: [], invites: [] };
+let db = { users: [], creds: [], subs: [], invites: [], oauthClients: [], oauthCodes: [], oauthTokens: [] };
 try { db = JSON.parse(fs.readFileSync(dbFile, 'utf8')); } catch {}
 db.subs = db.subs || [];
 db.invites = db.invites || [];
+db.oauthClients = db.oauthClients || [];
+db.oauthCodes = db.oauthCodes || [];   // ephemeral in intent, but persisted like everything else here — cleaned by expiry below
+db.oauthTokens = db.oauthTokens || [];
 const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(user.id));
 function saveDb() { atomicWrite(dbFile, JSON.stringify(db, null, 2)); }
 function atomicWrite(file, content) {
@@ -190,9 +193,25 @@ function readSession(req) {
 }
 // Guard for /api/admin/* — resolves the caller and 401/403s if they aren't an admin.
 function requireAdmin(req, res) {
-  const user = readSession(req);
+  const user = resolveUser(req);
   if (!user) { json(res, 401, { error: 'not signed in' }); return null; }
   if (!isAdmin(user)) { json(res, 403, { error: 'forbidden' }); return null; }
+  return user;
+}
+// Resolves the caller from either a browser session cookie OR an OAuth bearer token —
+// every /api/* route that used to call readSession(req) directly now calls this instead, so
+// an MCP client (or any other OAuth-authorized tool) can use the same endpoints a browser does.
+function resolveUser(req) {
+  return readSession(req) || bearerUser(req);
+}
+function bearerUser(req) {
+  const auth = req.headers['authorization'] || '';
+  const m = /^Bearer\s+(.+)$/i.exec(auth);
+  if (!m) return null;
+  const tok = db.oauthTokens.find(t => t.token === m[1]);
+  if (!tok || (tok.expires && tok.expires < Date.now())) return null;
+  const user = db.users.find(u => u.id === tok.userId);
+  if (!user || user.disabled) return null;
   return user;
 }
 function sessionCookie(user) {
@@ -251,6 +270,193 @@ function livePresence(uid) {
 }
 setInterval(() => { for (const [k, v] of presence) if (Date.now() - v.updatedAt > PRESENCE_TTL) presence.delete(k); }, 30000).unref();
 
+/* ---------- OAuth 2.0 (Authorization Code + PKCE) ----------
+   Wraps the existing passkey session in a scoped, revocable, expiring bearer token so a
+   third-party client (e.g. an MCP server) never has to hold — or be trusted with — the raw
+   session cookie. Deliberately minimal: one grant type (authorization_code + PKCE, S256 only,
+   no client secret — this is the public-client flow, matching how MCP clients and native/CLI
+   apps are expected to authenticate per RFC 8252). No refresh tokens yet; re-auth on expiry
+   is a Q&A/day, not a runtime problem — flagged in AGENTS.md as a first follow-up if this
+   sees real MCP usage. */
+const OAUTH_CODE_TTL = 5 * 60 * 1000;         // auth code: short-lived, single-use
+const OAUTH_TOKEN_TTL = 90 * 24 * 3600 * 1000; // access token: matches SESSION_DAYS' spirit — long-lived personal instance, not a public multi-tenant API
+
+// A client only needs to be *known*, not secret — PKCE is what proves possession. Registered
+// once here for the first-party MCP server; POST /oauth/register lets any other client
+// self-register too (dynamic client registration, RFC 7591 subset) since this is a personal
+// instance, not a public API with abuse concerns.
+function ensureDefaultOAuthClient() {
+  if (!db.oauthClients.some(c => c.id === 'opengym-mcp')) {
+    db.oauthClients.push({
+      id: 'opengym-mcp', name: 'openGym MCP', created: new Date().toISOString(),
+      redirectUris: ['http://localhost:8765/callback', 'urn:ietf:wg:oauth:2.0:oob']
+    });
+    saveDb();
+  }
+}
+ensureDefaultOAuthClient();
+
+function b64uSha256(s) { return crypto.createHash('sha256').update(s).digest('base64url'); }
+
+function renderAuthorizePage(user, query) {
+  const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const hidden = Object.entries(query).map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`).join('');
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Authorize — openGym</title>
+<style>body{font:16px system-ui;max-width:420px;margin:15vh auto;padding:0 24px;color:#222}
+h1{font-size:20px}p{color:#555}button{width:100%;padding:14px;border-radius:10px;border:0;font-size:16px;margin-top:8px;cursor:pointer}
+.allow{background:#16a34a;color:#fff}.deny{background:#eee;color:#333}</style></head><body>
+<h1>Authorize access to openGym</h1>
+<p><b>${esc(query.client_id)}</b> wants access to <b>${esc(user.name)}</b>'s openGym account
+(read and log workouts, bodyweight, routines).</p>
+<form method="POST" action="/oauth/authorize">${hidden}
+<input type="hidden" name="decision" value="allow"><button class="allow" type="submit">Allow</button></form>
+<form method="POST" action="/oauth/authorize">${hidden}
+<input type="hidden" name="decision" value="deny"><button class="deny" type="submit">Deny</button></form>
+</body></html>`;
+}
+
+function html(res, code, body) {
+  res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(body);
+}
+function readFormBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0; const chunks = [];
+    req.on('data', d => { size += d.length; if (size > MAX_BODY) { reject(new Error('body too large')); req.destroy(); return; } chunks.push(d); });
+    req.on('end', () => { try { resolve(Object.fromEntries(new URLSearchParams(Buffer.concat(chunks).toString('utf8')))); } catch { reject(new Error('bad form body')); } });
+    req.on('error', reject);
+  });
+}
+
+const oauthRoutes = {
+  // RFC 8414 discovery — lets a well-behaved OAuth/MCP client find these endpoints on its own.
+  'GET /.well-known/oauth-authorization-server': async (req, res) => json(res, 200, {
+    issuer: ORIGIN,
+    authorization_endpoint: ORIGIN + '/oauth/authorize',
+    token_endpoint: ORIGIN + '/oauth/token',
+    registration_endpoint: ORIGIN + '/oauth/register',
+    response_types_supported: ['code'],
+    grant_types_supported: ['authorization_code'],
+    code_challenge_methods_supported: ['S256'],
+    token_endpoint_auth_methods_supported: ['none']
+  }),
+
+  // Dynamic client registration (minimal RFC 7591 subset) — any client can self-register a
+  // redirect URI. No approval step: this instance has no third-party-app abuse surface,
+  // it's one household's server. client_id returned is opaque and never treated as a secret.
+  'POST /oauth/register': async (req, res) => {
+    const body = await readBody(req);
+    const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris.filter(u => typeof u === 'string') : [];
+    if (!redirectUris.length) return json(res, 400, { error: 'redirect_uris required' });
+    const id = crypto.randomBytes(12).toString('base64url');
+    db.oauthClients.push({ id, name: String(body.client_name || 'unnamed client').slice(0, 80), created: new Date().toISOString(), redirectUris });
+    saveDb();
+    json(res, 201, { client_id: id, redirect_uris: redirectUris, token_endpoint_auth_method: 'none' });
+  },
+
+  // GET: show the consent screen (requires an existing browser session — the human logging
+  // into openGym via passkey is what this redirects to first if there's no session yet).
+  'GET /oauth/authorize': async (req, res) => {
+    const url = new URL(req.url, 'http://x');
+    const q = Object.fromEntries(url.searchParams);
+    const client = db.oauthClients.find(c => c.id === q.client_id);
+    if (!client) return json(res, 400, { error: 'unknown client_id' });
+    if (!client.redirectUris.includes(q.redirect_uri)) return json(res, 400, { error: 'redirect_uri not registered for this client' });
+    if (q.response_type !== 'code') return json(res, 400, { error: 'response_type must be code' });
+    if (q.code_challenge_method !== 'S256' || !q.code_challenge) return json(res, 400, { error: 'PKCE (S256) code_challenge required' });
+    const user = readSession(req);
+    if (!user) {
+      // No frontend route currently restores an in-flight OAuth request after passkey login,
+      // so rather than silently drop the params, tell the human what to do: log in first (same
+      // browser/tab), then reopen this exact URL. The MCP client's own instructions point here.
+      return html(res, 200, `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in required — openGym</title>
+<style>body{font:16px system-ui;max-width:420px;margin:15vh auto;padding:0 24px;color:#222;text-align:center}
+a.btn{display:inline-block;margin-top:16px;padding:14px 22px;border-radius:10px;background:#16a34a;color:#fff;text-decoration:none}</style>
+</head><body><h1>Sign in to openGym first</h1>
+<p>You need an active openGym session in this browser before you can authorize an app.</p>
+<a class="btn" href="/?next=${encodeURIComponent(req.url)}">Sign in with passkey</a></body></html>`);
+    }
+    html(res, 200, renderAuthorizePage(user, q));
+  },
+
+  // POST: the consent form submits here (Allow/Deny), then redirects back to the client's
+  // redirect_uri with a one-time code (Allow) or an OAuth error (Deny).
+  'POST /oauth/authorize': async (req, res) => {
+    const body = await readFormBody(req);
+    const client = db.oauthClients.find(c => c.id === body.client_id);
+    if (!client || !client.redirectUris.includes(body.redirect_uri)) return json(res, 400, { error: 'invalid client or redirect_uri' });
+    const redirect = new URL(body.redirect_uri);
+    if (body.decision !== 'allow') {
+      redirect.searchParams.set('error', 'access_denied');
+      if (body.state) redirect.searchParams.set('state', body.state);
+      res.writeHead(302, { Location: redirect.toString() }); return res.end();
+    }
+    const user = readSession(req);
+    if (!user) return json(res, 401, { error: 'not signed in' });
+    const code = crypto.randomBytes(24).toString('base64url');
+    db.oauthCodes.push({
+      code, userId: user.id, clientId: client.id, redirectUri: body.redirect_uri,
+      codeChallenge: body.code_challenge, exp: Date.now() + OAUTH_CODE_TTL
+    });
+    saveDb();
+    redirect.searchParams.set('code', code);
+    if (body.state) redirect.searchParams.set('state', body.state);
+    res.writeHead(302, { Location: redirect.toString() }); return res.end();
+  },
+
+  // Authorization code + PKCE verifier -> access token. No client secret (public client);
+  // possession of the original code_verifier is what proves this is the same app that started
+  // the flow, per RFC 7636.
+  'POST /oauth/token': async (req, res) => {
+    const body = await readFormBody(req);
+    if (body.grant_type !== 'authorization_code') return json(res, 400, { error: 'unsupported_grant_type' });
+    const idx = db.oauthCodes.findIndex(c => c.code === body.code);
+    if (idx < 0) return json(res, 400, { error: 'invalid_grant' });
+    const grant = db.oauthCodes[idx];
+    db.oauthCodes.splice(idx, 1); // single-use, always consumed even on failure below
+    if (grant.exp < Date.now()) { saveDb(); return json(res, 400, { error: 'invalid_grant', error_description: 'code expired' }); }
+    if (grant.clientId !== body.client_id || grant.redirectUri !== body.redirect_uri) { saveDb(); return json(res, 400, { error: 'invalid_grant' }); }
+    if (!body.code_verifier || b64uSha256(body.code_verifier) !== grant.codeChallenge) { saveDb(); return json(res, 400, { error: 'invalid_grant', error_description: 'PKCE verification failed' }); }
+    const user = db.users.find(u => u.id === grant.userId);
+    if (!user || user.disabled) { saveDb(); return json(res, 400, { error: 'invalid_grant' }); }
+    const token = crypto.randomBytes(32).toString('base64url');
+    const expires = Date.now() + OAUTH_TOKEN_TTL;
+    db.oauthTokens.push({ token, userId: user.id, clientId: grant.clientId, created: new Date().toISOString(), expires });
+    saveDb();
+    json(res, 200, { access_token: token, token_type: 'Bearer', expires_in: Math.floor(OAUTH_TOKEN_TTL / 1000) });
+  },
+
+  // Lets a client (or the user, from Settings) proactively kill a token — e.g. "revoke MCP access".
+  'POST /oauth/revoke': async (req, res) => {
+    const user = resolveUser(req);
+    if (!user) return json(res, 401, { error: 'not signed in' });
+    const body = await readBody(req);
+    const before = db.oauthTokens.length;
+    db.oauthTokens = db.oauthTokens.filter(t => !(t.token === body.token && t.userId === user.id));
+    saveDb();
+    json(res, 200, { ok: true, revoked: before - db.oauthTokens.length });
+  },
+
+  'GET /api/oauth/tokens': async (req, res) => {
+    const user = resolveUser(req);
+    if (!user) return json(res, 401, { error: 'not signed in' });
+    json(res, 200, {
+      tokens: db.oauthTokens.filter(t => t.userId === user.id).map(t => ({
+        token: t.token.slice(0, 8) + '…', client: (db.oauthClients.find(c => c.id === t.clientId) || {}).name || t.clientId,
+        created: t.created, expires: t.expires
+      }))
+    });
+  }
+};
+setInterval(() => {
+  const now = Date.now();
+  const before = db.oauthCodes.length;
+  db.oauthCodes = db.oauthCodes.filter(c => c.exp >= now);
+  if (db.oauthCodes.length !== before) saveDb();
+}, 60000).unref();
+
 /* ---------- routes ---------- */
 const routes = {
   'GET /api/health': async (req, res) => json(res, 200, { ok: true, users: db.users.length }),
@@ -259,7 +465,7 @@ const routes = {
   'GET /api/config': async (req, res) => json(res, 200, { invite_only: INVITE_ONLY }),
 
   'GET /api/me': async (req, res) => {
-    const user = readSession(req);
+    const user = resolveUser(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } });
   },
@@ -365,7 +571,7 @@ const routes = {
   // The caller's own cookie is cleared here too, so the browser doing it doesn't sit on a token
   // it no longer accepts. Passkeys are untouched: signing back in works immediately.
   'POST /api/logout/all': async (req, res) => {
-    const user = readSession(req);
+    const user = resolveUser(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     user.sv = sessionVersion(user) + 1;
     saveDb();
@@ -373,7 +579,7 @@ const routes = {
   },
 
   'GET /api/data': async (req, res) => {
-    const user = readSession(req);
+    const user = resolveUser(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     try {
       const state = JSON.parse(fs.readFileSync(stateFile(user.id), 'utf8'));
@@ -382,7 +588,7 @@ const routes = {
   },
 
   'PUT /api/data': async (req, res) => {
-    const user = readSession(req);
+    const user = resolveUser(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     const body = await readBody(req);
     if (!body.state || typeof body.state !== 'object') return json(res, 400, { error: 'state required' });
@@ -394,7 +600,7 @@ const routes = {
   'GET /api/push/public-key': async (req, res) => json(res, 200, { key: vapid.publicKey }),
 
   'POST /api/push/subscribe': async (req, res) => {
-    const user = readSession(req);
+    const user = resolveUser(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     const body = await readBody(req);
     const sub = body.subscription;
@@ -406,7 +612,7 @@ const routes = {
   },
 
   'POST /api/push/unsubscribe': async (req, res) => {
-    const user = readSession(req);
+    const user = resolveUser(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     const body = await readBody(req);
     db.subs = db.subs.filter(s => !(s.userId === user.id && s.endpoint === body.endpoint));
@@ -415,14 +621,14 @@ const routes = {
   },
 
   'POST /api/push/test': async (req, res) => {
-    const user = readSession(req);
+    const user = resolveUser(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     await sendPush(user.id, { title: 'openGym', body: 'Test notification ✅ — this is what alerts look like.', tag: 'test' });
     json(res, 200, { ok: true });
   },
 
   'POST /api/push/rest-timer': async (req, res) => {
-    const user = readSession(req);
+    const user = resolveUser(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     const body = await readBody(req);
     const sec = Math.max(1, Math.min(3600, Math.round(+body.seconds || 0)));
@@ -432,7 +638,7 @@ const routes = {
   },
 
   'POST /api/push/rest-timer/cancel': async (req, res) => {
-    const user = readSession(req);
+    const user = resolveUser(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     cancelRestTimer(user.id);
     json(res, 200, { ok: true });
@@ -440,7 +646,7 @@ const routes = {
 
   // Live-workout heartbeat: client pings while a workout is on screen; { active:false } drops it.
   'POST /api/activity': async (req, res) => {
-    const user = readSession(req);
+    const user = resolveUser(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     const body = await readBody(req);
     if (body.active) {
@@ -544,7 +750,7 @@ const routes = {
 http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   const key = req.method + ' ' + url.pathname;
-  const handler = routes[key];
+  const handler = routes[key] || oauthRoutes[key];
   if (!handler) return json(res, 404, { error: 'not found' });
   try { await handler(req, res); }
   catch (e) {

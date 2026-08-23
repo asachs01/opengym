@@ -1,0 +1,17 @@
+{
+  "name": "opengym-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server for openGym — log workouts and bodyweight, query history, from any MCP-capable AI client.",
+  "license": "AGPL-3.0-or-later",
+  "bin": { "opengym-mcp": "./index.js" },
+  "scripts": {
+    "start": "node index.js",
+    "auth": "node auth.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.24.0"
+  }
+}
