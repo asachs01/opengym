@@ -11,6 +11,11 @@ export const DEF = {
   theme: 'dark', accent: 'lime', body: 'male', targetW: null,
   bodyweight: [], routines: [], week: {}, dayPlan: {},
   exWeights: {}, workouts: [], active: null, customEx: [], gifSize: 'full',
+  // Equipment profiles (e.g. "Home", "Gym") — each is { id, name, eq: [...equipment tags] }.
+  // activeEquip is the id of whichever one is currently filtering the Library/picker/routines,
+  // or null for no filtering (see lib/equipment.js). Profiles themselves are never auto-deleted
+  // by anything that reads them — only Settings' own "Delete profile" removes one.
+  equipProfiles: [], activeEquip: null,
   // effort: which per-set effort scale is logged — 'none' | 'rir' | 'rpe'. null, not 'none', so
   // that a profile which never chose (loaded state is overlaid on DEF, on every path: local,
   // server pull, backup import) still falls back to the `showRir` boolean this replaced and

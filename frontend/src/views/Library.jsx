@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useStore } from '../store/useStore.js'
 import { EXDB, BODYPARTS, allExercises, equipmentOf } from '../lib/exercises.js'
+import { activeProfile, exAvailable } from '../lib/equipment.js'
 import { bestWeightFor } from '../lib/history.js'
 import { fmtNum } from '../lib/format.js'
 import { t } from '../lib/i18n.js'
@@ -15,8 +16,11 @@ export default function Library() {
   const [bp, setBp] = useState('')
   const [eq, setEq] = useState('')
   const [shown, setShown] = useState(40)
+  const [showAll, setShowAll] = useState(false)
+  const profile = activeProfile(S)
   const ql = q.toLowerCase().trim()
-  const base = allExercises(S).filter(e => (!bp || e.bp === bp) && (!ql || e.n.toLowerCase().includes(ql) || e.tg.includes(ql) || e.eq.includes(ql) || (e.desc || '').toLowerCase().includes(ql)))
+  const filtered = allExercises(S).filter(e => (!bp || e.bp === bp) && (!ql || e.n.toLowerCase().includes(ql) || e.tg.includes(ql) || e.eq.includes(ql) || (e.desc || '').toLowerCase().includes(ql)))
+  const base = (profile && !showAll) ? filtered.filter(e => exAvailable(e, profile)) : filtered
   const eqOpts = equipmentOf(base)
   // Drop the equipment filter if the search narrowed it away, so you never hit a dead end.
   const eqOn = eqOpts.includes(eq) ? eq : ''
@@ -24,6 +28,10 @@ export default function Library() {
 
   return <>
     <div className="hdr"><div><h1>{t('Exercises')}</h1><div className="sub">{t('{0} exercises with animations', EXDB.length)}</div></div></div>
+    {profile && <div className="chips" style={{ marginBottom: 10 }}>
+      <button className={'chip' + (!showAll ? ' on' : '')} onClick={() => setShowAll(false)}><Icon name="dumbbell" style={{ fontSize: 12, display: 'inline-block', marginRight: 4, verticalAlign: '-1px' }} />{t('{0} only', profile.name)}</button>
+      <button className={'chip nocap' + (showAll ? ' on' : '')} onClick={() => setShowAll(true)}>{t('Show all equipment')}</button>
+    </div>}
     <div className="search" style={{ marginBottom: 10 }}><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" /><path d="m21 21-4.3-4.3" /></svg>
       <input className="input" placeholder={t('Search…')} value={q} onChange={e => { setQ(e.target.value); setShown(40) }} /></div>
     <div className="chips" style={{ marginBottom: eqOpts.length > 1 ? 8 : 12 }}>
@@ -53,3 +61,4 @@ export default function Library() {
     {f.length > shown && <><div style={{ height: 10 }} /><Button onClick={() => setShown(s => s + 40)}>{t('Show more')}</Button></>}
   </>
 }
+

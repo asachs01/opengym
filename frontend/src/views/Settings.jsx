@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useStore, DEF, hasData } from '../store/useStore.js'
 import { useUI } from '../store/useUI.js'
-import { ACCENTS, todayISO, localTZ } from '../lib/format.js'
+import { ACCENTS, todayISO, localTZ, uid } from '../lib/format.js'
 import { effortOf } from '../lib/history.js'
 import { api, webauthnOK, passkeyLogin, passkeyRegister, IS_ANDROID } from '../lib/api.js'
 import { pushSupported, enablePush, disablePush, sendTestPush } from '../lib/push.js'
@@ -10,7 +10,7 @@ import { wakeLockSupported } from '../lib/wakelock.js'
 import { t, LANGS, INSTR_LANGS } from '../lib/i18n.js'
 import { DEMO, REPO } from '../lib/demo.js'
 import { MOBILE, shareExport, syncReminder } from '../lib/mobile.js'
-import { loadStarterPlan, confirmSheet, importFromApp } from '../sheets.jsx'
+import { loadStarterPlan, confirmSheet, importFromApp, equipmentProfileSheet } from '../sheets.jsx'
 import Icon from '../components/Icon.jsx'
 import { Section, Row, SelectRow, Switch, Segmented, Button, TextField } from '../components/ui.jsx'
 
@@ -141,6 +141,9 @@ export default function Settings() {
     </Section>
 
     {(user || MOBILE) && <NotificationsCard S={S} update={update} toast={toast} />}
+
+    {/* ---------- equipment ---------- */}
+    <EquipmentCard S={S} update={update} />
 
     {/* ---------- appearance ---------- */}
     <Section title={t('Appearance')} footer={DEMO || MOBILE ? undefined : t('synced with your profile')}>
@@ -325,6 +328,43 @@ function PushCard({ S, update, toast }) {
     </Section>
     {on && <div style={{ marginTop: -12, marginBottom: 22 }}><Button size="sm" icon="bell" onClick={test}>{t('Send test notification')}</Button></div>}
   </>
+}
+
+// Equipment profiles ("Home", "Gym", ...) — each an id/name/eq-list; the active one filters
+// the Library, exercise picker, and flags routine entries that need something outside it
+// (see lib/equipment.js). Kept in Settings rather than its own screen: it's set-and-forget,
+// not something you tune mid-workout.
+function EquipmentCard({ S, update }) {
+  const profiles = S.equipProfiles || []
+  const active = profiles.find(p => p.id === S.activeEquip) || null
+  const setActive = id => update(s => { s.activeEquip = id })
+  const addProfile = () => equipmentProfileSheet(null, (name, eq) => {
+    const p = { id: uid(), name, eq }
+    update(s => { s.equipProfiles = [...(s.equipProfiles || []), p]; s.activeEquip = p.id })
+  })
+  const editProfile = p => equipmentProfileSheet(p, (name, eq) => {
+    update(s => { s.equipProfiles = s.equipProfiles.map(x => x.id === p.id ? { ...x, name, eq } : x) })
+  }, () => {
+    update(s => {
+      s.equipProfiles = s.equipProfiles.filter(x => x.id !== p.id)
+      if (s.activeEquip === p.id) s.activeEquip = null
+    })
+  })
+  return <Section title={t('Equipment')}
+    footer={active
+      ? t('Library, the exercise picker, and your routines only show what "{0}" has — body weight is always included.', active.name)
+      : t('Add what you have at home or at the gym, then switch it on here to filter exercises down to it.')}>
+    <Row icon="dumbbell" iconTint="var(--acc)" title={t('Filter by equipment')}>
+      <Switch checked={!!active} onChange={v => setActive(v ? (profiles[0]?.id || null) : null)} />
+    </Row>
+    {profiles.length > 0 && <SelectRow icon="list" iconTint="var(--blue)" title={t('Active profile')}
+      value={S.activeEquip || ''} onChange={v => setActive(v || null)}
+      options={[{ value: '', label: t('None — show everything') }, ...profiles.map(p => ({ value: p.id, label: p.name + ' (' + p.eq.length + ')' }))]} />}
+    {profiles.map(p => <Row key={p.id} icon="pencil" iconTint="var(--grey)" title={p.name}
+      subtitle={p.eq.length ? p.eq.map(x => t(x)).join(', ') : t('No equipment added yet')}
+      accessory="chevron" onClick={() => editProfile(p)} />)}
+    <Row icon="plus" iconTint="var(--indigo)" title={t('Add equipment profile')} accessory="chevron" onClick={addProfile} />
+  </Section>
 }
 
 // The same registration as the sign-in screen's, reached from Settings instead. It asks for

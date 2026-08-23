@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useStore } from './store/useStore.js'
 import { useUI } from './store/useUI.js'
 import { EXDB, EXIDX, BODYPARTS, isCardio, isBodyweightEq, allExercises, equipmentOf } from './lib/exercises.js'
+import { ALL_EQUIPMENT, activeProfile, exAvailable } from './lib/equipment.js'
 import { fmtDate, fmtNum, fmtVol, fmtDur, durPart, todayISO, uid, exCount, DAYN, MONTHS_LONG, ACCENTS } from './lib/format.js'
 import { lastEntryFor, bestWeightFor, buildSets, effectiveRoutineId, workoutVolume, setsDone, setsDoneActive, lastBW, supersetUnits, unitOf, setLabel, defaultConfig, cleanupSg, modeOf, effortOf, isBw, isPerSide, sideReps } from './lib/history.js'
 import { beep, vibrate } from './lib/sound.js'
@@ -380,6 +381,42 @@ function CustomExForm({ existing, prefill, onDone, close }) {
 }
 export const customExSheet = (existing, onDone, prefill) => ui().openSheet(close => <CustomExForm existing={existing} prefill={prefill} onDone={onDone} close={close} />)
 
+/* ============================ equipment profiles ============================ */
+// A profile is { id, name, eq: [...equipment tags from ALL_EQUIPMENT] }. Body weight is never
+// shown as a toggle here — it's always available (see lib/equipment.js) so there's nothing to
+// turn on or off for it.
+function EquipmentProfileForm({ existing, onSave, onDelete, close }) {
+  const [name, setName] = useState(existing ? existing.name : '')
+  const [eq, setEq] = useState(existing ? [...(existing.eq || [])] : [])
+  const toggle = tag => setEq(cur => cur.includes(tag) ? cur.filter(x => x !== tag) : [...cur, tag])
+  const save = () => {
+    const n = name.trim()
+    if (!n) { toast(t('Give it a name')); return }
+    close()
+    onSave(n, eq)
+    toast(t('Saved'))
+  }
+  return <>
+    <h3>{existing ? t('Edit equipment profile') : t('New equipment profile')}</h3>
+    <div className="muted small" style={{ marginBottom: 12 }}>{t('e.g. “Home” or “Gym” — pick everything you have access to there. Body weight is always included.')}</div>
+    <input className="input" placeholder={t('Profile name')} value={name} onChange={e => setName(e.target.value)} />
+    <div className="chips" style={{ margin: '14px 0 4px' }}>
+      {ALL_EQUIPMENT.map(x => <button key={x} className={'chip' + (eq.includes(x) ? ' on' : '')} onClick={() => toggle(x)}>{t(x)}</button>)}
+    </div>
+    <div style={{ height: 14 }} />
+    <Button variant="primary" onClick={save}>{existing ? t('Save') : t('Create profile')}</Button>
+    {existing && <><div style={{ height: 8 }} /><Button variant="danger" icon="trash" onClick={() => {
+      close()
+      confirmSheet({
+        title: t('Delete “{0}”?', existing.name), message: t('This only removes the profile — your routines and exercises are unaffected.'),
+        confirmText: t('Delete'), danger: true, onConfirm: () => { onDelete && onDelete() },
+      })
+    }}>{t('Delete profile')}</Button></>}
+  </>
+}
+export const equipmentProfileSheet = (existing, onSave, onDelete) => ui().openSheet(close => <EquipmentProfileForm existing={existing} onSave={onSave} onDelete={onDelete} close={close} />)
+
+
 export function deleteCustomEx(ex, afterDelete) {
   if (S().active?.entries.some(e => e.id === ex.id)) { toast(t('Finish your current workout first')); return }
   confirmSheet({
@@ -415,11 +452,14 @@ function ExercisePicker({ onPick, close }) {
   const [bp, setBp] = useState('')          // '' = all, '★' = chosen, else a body part
   const [eq, setEq] = useState('')          // '' = any equipment
   const [shown, setShown] = useState(50)
+  const [showAll, setShowAll] = useState(false)
+  const profile = activeProfile(st)
   const ql = q.toLowerCase().trim()
   const all = allExercises(st)
   let base = all.filter(e =>
     (bp === '★' ? usage[e.id] : (!bp || e.bp === bp)) &&
     (!ql || e.n.toLowerCase().includes(ql) || e.tg.includes(ql) || e.eq.includes(ql) || (e.desc || '').toLowerCase().includes(ql)))
+  if (profile && !showAll) base = base.filter(e => exAvailable(e, profile))
   if (bp === '★') base = [...base].sort((a, b) => (usage[b.id] - usage[a.id]) || (a.n < b.n ? -1 : 1))
   const eqOpts = equipmentOf(base)
   // Drop the equipment filter if the search narrowed it away, so you never hit a dead end.
@@ -430,6 +470,10 @@ function ExercisePicker({ onPick, close }) {
     <h3>{t('Add exercise')}</h3>
     <div className="search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" /><path d="m21 21-4.3-4.3" /></svg>
       <input className="input" placeholder={t('Search {0} exercises…', all.length)} value={q} onChange={e => { setQ(e.target.value); setShown(50) }} /></div>
+    {profile && <div className="chips" style={{ margin: '10px 0 0' }}>
+      <button className={'chip' + (!showAll ? ' on' : '')} onClick={() => setShowAll(false)}><Icon name="dumbbell" style={{ fontSize: 12, display: 'inline-block', marginRight: 4, verticalAlign: '-1px' }} />{t('{0} only', profile.name)}</button>
+      <button className={'chip nocap' + (showAll ? ' on' : '')} onClick={() => setShowAll(true)}>{t('Show all equipment')}</button>
+    </div>}
     <div className="chips" style={{ margin: eqOpts.length > 1 ? '10px 0 6px' : '10px 0' }}>
       {chosenCount > 0 && <button className={'chip' + (bp === '★' ? ' on' : '')} onClick={() => { setBp('★'); setEq(''); setShown(50) }}><Icon name="starFill" style={{ fontSize: 12, display: 'inline-block', marginRight: 4, verticalAlign: '-1px' }} />{t('Chosen')} ({chosenCount})</button>}
       <button className={'chip nocap' + (!bp ? ' on' : '')} onClick={() => { setBp(''); setEq(''); setShown(50) }}>{t('All')}</button>
